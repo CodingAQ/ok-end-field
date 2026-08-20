@@ -23,6 +23,11 @@ class _FakeTask:
         self._exited = False
         self.actions = []
         self.debug = False
+        # 模拟「技力随时间变化」：skill 可为 int（恒定）或 list（按帧索引，只读不消费）
+        # 模拟「发键 no-op」：send_key_consumes=False 时发键不扣技力
+        self.send_key_consumes = True
+        self.link_fired_at_frame = None  # 连携技实际释放帧（供「立即性」断言）
+        self.ult_fired_at_frame = None   # 终结技实际释放帧
 
     # ── 时间 / 帧 ──
     def active_time(self):
@@ -87,6 +92,9 @@ class _FakeTask:
 
     # ── 检测 ──
     def get_skill_bar_count(self):
+        if isinstance(self._skill, list):
+            idx = min(self._frame, len(self._skill) - 1)
+            return self._skill[idx]
         return self._skill
 
     def find_one(self, name, **k):
@@ -102,17 +110,24 @@ class _FakeTask:
         for u in ults:
             if u in self._ults:
                 self.actions.append(f"ult_{u}")
+                self.ult_fired_at_frame = self._frame
+                self._ults.discard(u)  # 模拟真实消耗：释放后指示消失
                 return True
         return False
 
     def use_link_skill(self):
         if self._link:
             self.actions.append("e")
+            self.link_fired_at_frame = self._frame
+            self._link = False  # 模拟真实消耗：释放后指示消失
             return True
         return False
 
     def send_key(self, key):
         self.actions.append(key)
+        if self.send_key_consumes and isinstance(self._skill, list):
+            # 发键消耗 1 点技力（仅对按帧变化的 list 生效；int 恒定不受影响）
+            self._skill[self._frame] = max(0, self._skill[self._frame] - 1)
 
     def press_combat_key(self, key):
         self.actions.append(key)
@@ -243,6 +258,92 @@ class TestConditionalRotationCombat(unittest.TestCase):
         logic = AutoCombatLogic(task)
         result = logic.run(start_sleep=0, deadline=1.0)
         self.assertFalse(result)
+
+    # ── 修复回归：等待技力期间不得阻断「立即释放」 ────────────────
+
+    @patch.object(pyautogui, "mouseDown")
+    @patch.object(pyautogui, "mouseUp")
+    def test_instant_release_not_blocked_while_skill_pending(self, _mu, _md):
+        """数字战技技力不足进入 pending 时，首帧即放行立即释放连携技。
+
+        复现修复前的卡死：失败/等待帧 had_action=True 阻断立即释放，
+        连携技要等 pending 超时/重建窗口才能释放（落在 '1' 之后）。
+        修复后：失败帧即放行 'e'，技力恢复后 '1' 再补放。
+        """
+        cfg = {
+            "启用实时条件": True,
+            "实时条件序列": ["1"],
+            "立即释放连携技": True,
+        }
+        # 技力按帧变化：第 3 帧恢复 1 点，发键消耗后回 0
+        task = _FakeTask(cfg, ults=(), link=True, skill=[0, 0, 1] + [0] * 20)
+        logic = AutoCombatLogic(task)
+        logic.run(start_sleep=0)
+        # 修复后 actions == ["e", "1"]；修复前为 ["1", "e"]（e 被饿到重建窗口）
+        self.assertIn("e", task.actions)
+        self.assertIn("1", task.actions)
+        self.assertLess(task.actions.index("e"), task.actions.index("1"))
+
+    @patch.object(pyautogui, "mouseDown")
+    @patch.object(pyautogui, "mouseUp")
+    def test_instant_ult_release_not_blocked_while_skill_pending(self, _mu, _md):
+        """数字战技等待技力期间，立即释放终结技同样首帧放行。"""
+        cfg = {
+            "启用实时条件": True,
+            "实时条件序列": ["1"],
+            "立即释放终结技": True,
+        }
+        task = _FakeTask(cfg, ults=[2], link=False, skill=[0, 0, 1] + [0] * 20)
+        logic = AutoCombatLogic(task)
+        logic.run(start_sleep=0)
+        self.assertIn("ult_2", task.actions)
+        self.assertIn("1", task.actions)
+        self.assertLess(task.actions.index("ult_2"), task.actions.index("1"))
+
+    @patch.object(pyautogui, "mouseDown")
+    @patch.object(pyautogui, "mouseUp")
+    def test_pending_wait_frames_yield_to_instant_release(self, _mu, _md):
+        """技力恒不足的等待帧每帧放行立即释放（修复前首个放行窗口在第 6 帧）。"""
+        cfg = {
+            "启用实时条件": True,
+            "实时条件序列": ["1"],
+            "立即释放连携技": True,
+        }
+        task = _FakeTask(cfg, ults=(), link=True, skill=0)  # 技力恒定 0
+        logic = AutoCombatLogic(task)
+        logic.run(start_sleep=0)
+        self.assertIsNotNone(task.link_fired_at_frame)
+        # 修复后：失败帧（第 1 帧）即放行；修复前：pending 5 帧超时（第 6 帧）才放行
+        self.assertLessEqual(task.link_fired_at_frame, 2)
+
+    @patch.object(pyautogui, "mouseDown")
+    @patch.object(pyautogui, "mouseUp")
+    def test_skill_still_retried_after_recovery(self, _mu, _md):
+        """回归保护：技力恢复后 pending 补放行为保留（不被过度修复）。"""
+        cfg = {
+            "启用实时条件": True,
+            "实时条件序列": ["1"],
+        }
+        task = _FakeTask(cfg, ults=(), link=False, skill=[0, 0, 1] + [0] * 20)
+        logic = AutoCombatLogic(task)
+        logic.run(start_sleep=0)
+        self.assertIn("1", task.actions)
+
+    @patch.object(pyautogui, "mouseDown")
+    @patch.object(pyautogui, "mouseUp")
+    def test_send_key_noop_snapshot(self, _mu, _md):
+        """残差快照：发键 no-op（不扣技力）时数字战技恒「成功」，
+        立即释放仅能靠重建帧放行（已知残差，Option C 后续加固）。"""
+        cfg = {
+            "启用实时条件": True,
+            "实时条件序列": ["1"],
+            "立即释放连携技": True,
+        }
+        task = _FakeTask(cfg, ults=(), link=True, skill=[1] * 25)
+        task.send_key_consumes = False  # 发键被吞：技力不降，'1' 恒成功
+        logic = AutoCombatLogic(task)
+        logic.run(start_sleep=0)
+        self.assertIn("e", task.actions)  # 重建帧放行（每轮 1 次）
 
 
 if __name__ == "__main__":
