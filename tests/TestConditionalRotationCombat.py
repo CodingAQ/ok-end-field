@@ -13,8 +13,7 @@ class _FakeTask:
     记录所有释放动作到 self.actions，供断言。
     """
 
-    def __init__(self, battle_config, ults=(), link=False, skill=3, team_visible=True,
-                 ult_persistent=False, link_persistent=False):
+    def __init__(self, battle_config, ults=(), link=False, skill=3, team_visible=True):
         self._cfg = battle_config
         self._ults = {str(u) for u in ults}
         self._link = link
@@ -29,11 +28,10 @@ class _FakeTask:
         self.send_key_consumes = True
         self.link_fired_at_frame = None  # 连携技实际释放帧（供「立即性」断言）
         self.ult_fired_at_frame = None   # 终结技实际释放帧
+        self.ult_call_frames = []   # use_ult 被调用的帧号（含失败帧；供「组内不检测」断言）
+        self.link_call_frames = []  # use_link_skill 被调用的帧号（含失败帧）
         # 战斗结束保护：team_visible=False 模拟队伍栏消失（in_team() 为 False）
         self.team_visible = team_visible
-        # 边沿触发用例：persistent=True 时释放后不消耗（模拟「检测持续命中」）
-        self.ult_persistent = ult_persistent
-        self.link_persistent = link_persistent
 
     # ── 时间 / 帧 ──
     def active_time(self):
@@ -111,32 +109,23 @@ class _FakeTask:
         return None
 
     # ── 动作 ──
-    def ult_ready(self, ult_sequence=None):
-        """只读检测终结技就绪（不按键、不消耗）。与 use_ult 的检测逻辑对应。"""
-        ults = [ult_sequence] if ult_sequence else ["1", "2", "3", "4"]
-        return any(u in self._ults for u in ults)
-
-    def link_ready(self):
-        """只读检测连携技就绪（不按键、不消耗）。与 use_link_skill 的检测逻辑对应。"""
-        return self._link
-
     def use_ult(self, ult_sequence=None):
+        self.ult_call_frames.append(self._frame)
         ults = [ult_sequence] if ult_sequence else ["1", "2", "3", "4"]
         for u in ults:
             if u in self._ults:
                 self.actions.append(f"ult_{u}")
                 self.ult_fired_at_frame = self._frame
-                if not self.ult_persistent:
-                    self._ults.discard(u)  # 模拟真实消耗：释放后指示消失
+                self._ults.discard(u)  # 模拟真实消耗：释放后指示消失
                 return True
         return False
 
     def use_link_skill(self):
+        self.link_call_frames.append(self._frame)
         if self._link:
             self.actions.append("e")
             self.link_fired_at_frame = self._frame
-            if not self.link_persistent:
-                self._link = False  # 模拟真实消耗：释放后指示消失
+            self._link = False  # 模拟真实消耗：释放后指示消失
             return True
         return False
 
@@ -319,7 +308,7 @@ class TestConditionalRotationCombat(unittest.TestCase):
     @patch.object(pyautogui, "mouseDown")
     @patch.object(pyautogui, "mouseUp")
     def test_pending_wait_frames_block_instant_release(self, _mu, _md):
-        """技力恒不足：pending 5 帧超时（组内）阻断立即释放，首个放行窗口在重建帧。"""
+        """技力恒不足：pending 重试帧与超时帧（均组内）阻断立即释放，重建帧才放行。"""
         cfg = {
             "启用实时条件": True,
             "实时条件序列": ["1"],
@@ -329,8 +318,9 @@ class TestConditionalRotationCombat(unittest.TestCase):
         logic = AutoCombatLogic(task)
         logic.run(start_sleep=0)
         self.assertIsNotNone(task.link_fired_at_frame)
-        # 组内 pending 5 帧（帧 0-4）超时跳过 → 生成器耗尽重建帧（帧 5）才放行
-        self.assertGreaterEqual(task.link_fired_at_frame, 5)
+        # 帧 1 "1" 失败进 pending、帧 2-5 重试失败（组内阻断）、帧 6 超时跳过（组内阻断）
+        # → 帧 7 生成器耗尽重建（组外）才放行
+        self.assertEqual(task.link_fired_at_frame, 7)
 
     @patch.object(pyautogui, "mouseDown")
     @patch.object(pyautogui, "mouseUp")
@@ -361,49 +351,45 @@ class TestConditionalRotationCombat(unittest.TestCase):
         logic.run(start_sleep=0)
         self.assertIn("e", task.actions)  # 重建帧放行（每轮 1 次）
 
-    # ── 修复：立即释放边沿触发（防刷屏）与战斗结束保护 ─────────────
+    # ── 核心语义：组内完全不检测 / 释放终结技与连携技；组外才立即释放 ────
 
     @patch.object(pyautogui, "mouseDown")
     @patch.object(pyautogui, "mouseUp")
-    def test_instant_ult_not_spammed_while_persistent_ready(self, _mu, _md):
-        """终结技持续就绪（释放后不消耗）时，立即释放只触发一次（边沿触发）。"""
+    def test_no_ult_detection_while_cond_group_running(self, _mu, _md):
+        """动作组运行期间不检测 / 不释放任何终结技与连携技（用户核心语义）。
+
+        序列 ["1","e"]、技力 [0,0,1]+0（帧号从 1 起）：
+        帧 1 "1" 失败进入 pending、帧 2 pending 重试成功补放 "1"、
+        帧 3 token "e"——期间 use_ult 零调用；仅各组生成器耗尽重建帧
+        （帧 4/12/20/28…）才调用一次。
+        """
+        cfg = {
+            "启用实时条件": True,
+            "实时条件序列": ["1", "e"],
+            "立即释放终结技": True,
+            "立即释放连携技": True,
+        }
+        task = _FakeTask(cfg, ults=[2], link=True, skill=[0, 0, 1] + [0] * 20)
+        logic = AutoCombatLogic(task)
+        logic.run(start_sleep=0)
+        # 动作组内（帧 1-3）零终结技检测；只有各组重建帧（>=4）调用
+        self.assertTrue(task.ult_call_frames)
+        self.assertFalse(any(f < 4 for f in task.ult_call_frames))
+        self.assertEqual(task.actions, ["1", "e", "ult_2"])
+
+    @patch.object(pyautogui, "mouseDown")
+    @patch.object(pyautogui, "mouseUp")
+    def test_instant_ult_released_once_when_consumed(self, _mu, _md):
+        """组外空转：终结技释放后消耗（检测失败）→ 只释放一次，不重复按。"""
         cfg = {
             "启用实时条件": True,
             "实时条件序列": [{"if": "link", "then": ["e"]}],  # link 不可用 → 组外空转
             "立即释放终结技": True,
         }
-        task = _FakeTask(cfg, ults=[2], link=False, skill=3, ult_persistent=True)
+        task = _FakeTask(cfg, ults=[2], link=False, skill=3)  # 释放即消耗
         logic = AutoCombatLogic(task)
         logic.run(start_sleep=0)
         self.assertEqual(task.actions.count("ult_2"), 1)
-
-    @patch.object(pyautogui, "mouseDown")
-    @patch.object(pyautogui, "mouseUp")
-    def test_instant_release_rearms_after_ready_gone(self, _mu, _md):
-        """边沿触发重新武装：释放（消耗）→ 检测失败重武装 → 再次就绪可再释放。"""
-        cfg = {
-            "启用实时条件": True,
-            "实时条件序列": [{"if": "link", "then": ["e"]}],
-            "立即释放终结技": True,
-        }
-        task = _FakeTask(cfg, ults=[2], link=False, skill=3)  # 释放即消耗
-        logic = AutoCombatLogic(task)
-        logic.cond_rotation_enabled = True
-        logic.instant_ult_enabled = True
-        logic.instant_link_enabled = False
-        # 就绪 + armed → 释放一次（消耗）并解除武装
-        logic._do_instant_release()
-        self.assertEqual(task.actions.count("ult_2"), 1)
-        self.assertFalse(logic._instant_ult_armed)
-        # 检测失败（已消耗）→ 重新武装；此时不释放
-        logic._do_instant_release()
-        self.assertTrue(logic._instant_ult_armed)
-        self.assertEqual(task.actions.count("ult_2"), 1)
-        # 能量再次就绪 → armed + 就绪 → 可再释放一次
-        task._ults.add("2")
-        logic._do_instant_release()
-        self.assertEqual(task.actions.count("ult_2"), 2)
-        self.assertFalse(logic._instant_ult_armed)
 
     @patch.object(pyautogui, "mouseDown")
     @patch.object(pyautogui, "mouseUp")

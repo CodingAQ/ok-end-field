@@ -52,9 +52,6 @@ class AutoCombatLogic:
         # 立即释放开关（本帧无动作时生效）
         self.instant_ult_enabled = False
         self.instant_link_enabled = False
-        # 立即释放边沿触发武装状态：就绪→释放一次→解除，检测失败后重新武装
-        self._instant_ult_armed = True
-        self._instant_link_armed = True
         # 战技失败暂存：技力不足时保留 token 下帧重试，不推进生成器
         self._pending_skill_token = None
         self._pending_skill_frames = 0  # 已重试帧数
@@ -197,10 +194,11 @@ class AutoCombatLogic:
         - 生成器耗尽（一轮遍历完）→ 重建（新一轮，重新求值所有条件）。
         - 战技 digit token 失败（技力不足）→ 暂存，下帧重试同一 token。
         - 其他 token（ult/e/sleep/normal）失败即跳过，不重试。
-        - 动作组运行期间（组内 token 执行中 / 失败 / 等待 / pending 重试）返回
-          had_action=True：阻断主循环的「立即释放」，保证动作组不被插入动作打断。
-        - 仅生成器耗尽重建帧返回 had_action=False：组外空闲期放行立即释放
-          （连携技 / 终结技）。
+        - 动作组运行期间（组内 token 执行中 / 失败 / 等待 / pending 重试 /
+          超时跳过）返回 had_action=True：**不检测、不释放任何终结技 / 连携技**，
+          保证动作组不被插入动作打断（若该步本身是 ult_N / e 动作则照常执行）。
+        - 仅生成器耗尽重建帧返回 had_action=False：组外空闲期放行「立即释放」
+          （检测并释放终结技 / 连携技）。
         - 无超时回退：持续运行至战斗结束。
 
         Returns:
@@ -217,7 +215,8 @@ class AutoCombatLogic:
                 self.task.log_info(f"技力不足超时 {self._pending_skill_frames} 帧，跳过战技 {token}")
                 self._pending_skill_token = None
                 self._pending_skill_frames = 0
-                return "", False
+                # 仍在动作组内（组内可能还有后续 token），不检测 / 不释放终结技与连携技
+                return "", True
 
             self._pending_skill_token = None  # 先清掉，若仍失败下面会重设
             success, signal = self._exec_rotation_token(token, deadline)
@@ -247,29 +246,20 @@ class AutoCombatLogic:
         return signal, True
 
     def _do_instant_release(self):
-        """本帧无条件动作时，按开关尝试立即释放终结技 / 连携技（边沿触发）。
+        """组外空闲帧（生成器耗尽重建帧）按开关立即释放终结技 / 连携技。
 
-        边沿触发：就绪时释放一次并解除武装；检测失败后重新武装，避免
-        终结技 / 连携技就绪期间每帧重复释放（刷屏、饿死动作组）。
-        优先级：终结技 > 连携技（仅本次真正释放终结技时让连携让位）。
-        战斗结束保护：in_team() 为 False（队伍栏消失）后不再释放。
+        仅当 had_action=False（动作组已跑完、组外空闲）时由主循环调用：
+        动作组运行期间不会走到这里，因此组内完全不检测终结技 / 连携技。
+        优先级：终结技 > 连携技。战斗结束保护：in_team() 为 False 后不再释放。
         """
         task = self.task
         if not task.in_team():  # 战斗结束保护：结算 / 队伍界面不再释放
             return
-        if self.instant_ult_enabled:
-            if not task.ult_ready():
-                self._instant_ult_armed = True
-            elif self._instant_ult_armed and task.use_ult():
-                task.log_info("立即释放终结技")
-                self._instant_ult_armed = False
-                return
-        if self.instant_link_enabled:
-            if not task.link_ready():
-                self._instant_link_armed = True
-            elif self._instant_link_armed and task.use_link_skill():
-                task.log_info("立即释放连携技")
-                self._instant_link_armed = False
+        if self.instant_ult_enabled and task.use_ult():
+            task.log_info("立即释放终结技")
+            return
+        if self.instant_link_enabled and task.use_link_skill():
+            task.log_info("立即释放连携技")
 
     def _is_low_resolution(self) -> bool:
         """当前画面分辨率是否低于 1080p。"""
@@ -337,9 +327,6 @@ class AutoCombatLogic:
         # 立即释放开关（仅在实时条件启用时生效）
         self.instant_ult_enabled = self.cond_rotation_enabled and task.get_battle_config(KEY_INSTANT_ULT, False)
         self.instant_link_enabled = self.cond_rotation_enabled and task.get_battle_config(KEY_INSTANT_LINK, False)
-        # 每次进入战斗重置边沿触发武装状态
-        self._instant_ult_armed = True
-        self._instant_link_armed = True
 
         if self.cond_rotation_enabled:
             task.log_info(f"实时条件已启用，AST 节点数={len(self.cond_ast)}（忽略普通排轴）")

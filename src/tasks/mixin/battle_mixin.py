@@ -206,31 +206,6 @@ class BattleMixin(BaseEfTask):
 
         return sequence if sequence else ["1", "2", "3"]
 
-    def ult_ready(self, ult_sequence: str = None) -> bool:
-        """只读检测终结技是否就绪（不按键、无 wait_until 阻塞）。
-
-        与 use_ult 的检测逻辑一致：依次检测 ult_1~4（或指定序列）。
-        供实时条件「立即释放」的边沿触发判断使用。
-        """
-        if ult_sequence is None:
-            ults = ['1', '2', '3', '4']
-        else:
-            ults = [ult_sequence]
-        return any(self._find_battle_ult("ult_" + ult) for ult in ults)
-
-    def link_ready(self) -> bool:
-        """只读检测连携技是否就绪（不按键、无 wait_until 阻塞）。
-
-        与 use_link_skill 的检测逻辑一致（default_link_skill 模板）。
-        供实时条件「立即释放」的边沿触发判断使用。
-        """
-        return bool(self.find_one(
-            "default_link_skill",
-            threshold=0.7,
-            vertical_variance=0.005,
-            horizontal_variance=0.005,
-        ))
-
     def use_ult(self, ult_sequence: str = None):
         """
         尝试释放终极技。
