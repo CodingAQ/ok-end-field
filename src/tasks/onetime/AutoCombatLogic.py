@@ -194,14 +194,20 @@ class AutoCombatLogic:
         - 生成器耗尽（一轮遍历完）→ 重建（新一轮，重新求值所有条件）。
         - 战技 digit token 失败（技力不足）→ 暂存，下帧重试同一 token。
         - 其他 token（ult/e/sleep/normal）失败即跳过，不重试。
+        - 动作组运行期间（组内 token 执行中 / 失败 / 等待 / pending 重试 /
+          超时跳过）返回 had_action=True：**不检测、不释放任何终结技 / 连携技**，
+          保证动作组不被插入动作打断（若该步本身是 ult_N / e 动作则照常执行）。
+        - 仅生成器耗尽重建帧返回 had_action=False：组外空闲期放行「立即释放」
+          （检测并释放终结技 / 连携技）。
         - 无超时回退：持续运行至战斗结束。
 
         Returns:
             tuple[signal, had_action]:
                 signal —— "" 正常 / "break" / "return_false"（来自 normal_ 内嵌循环）。
-                had_action —— 本帧是否产出了条件动作（供立即释放判断）。
+                had_action —— 本帧是否处于条件动作流程中（组内恒 True 阻断；
+                              仅生成器耗尽重建帧为 False，放行立即释放）。
         """
-        # 战技重试：上一帧 digit token 因技力不足失败，本帧重试同一 token（上限 15 帧）
+        # 战技重试：上一帧 digit token 因技力不足失败，本帧重试同一 token（上限 _SKILL_RETRY_MAX_FRAMES 帧，即 5 帧 ≈0.5s）
         if self._pending_skill_token is not None:
             token = self._pending_skill_token
             self._pending_skill_frames += 1
@@ -209,14 +215,15 @@ class AutoCombatLogic:
                 self.task.log_info(f"技力不足超时 {self._pending_skill_frames} 帧，跳过战技 {token}")
                 self._pending_skill_token = None
                 self._pending_skill_frames = 0
-                return "", False
+                # 仍在动作组内（组内可能还有后续 token），不检测 / 不释放终结技与连携技
+                return "", True
 
             self._pending_skill_token = None  # 先清掉，若仍失败下面会重设
             success, signal = self._exec_rotation_token(token, deadline)
             if not success and signal == "":
-                # 仍然技力不足，继续暂存等待下帧
+                # 仍然技力不足，继续暂存等待下帧；动作组运行中，阻断立即释放
                 self._pending_skill_token = token
-                return "", True  # had_action=True 阻断立即释放
+                return "", True
             self._pending_skill_frames = 0
             return signal, True
 
@@ -239,17 +246,20 @@ class AutoCombatLogic:
         return signal, True
 
     def _do_instant_release(self):
-        """本帧无条件动作时，按开关尝试立即释放终结技 / 连携技。
+        """组外空闲帧（生成器耗尽重建帧）按开关立即释放终结技 / 连携技。
 
-        优先级：终结技 > 连携技。与 _do_normal_combat_frame 一致使用无参检测+释放。
+        仅当 had_action=False（动作组已跑完、组外空闲）时由主循环调用：
+        动作组运行期间不会走到这里，因此组内完全不检测终结技 / 连携技。
+        优先级：终结技 > 连携技。战斗结束保护：in_team() 为 False 后不再释放。
         """
         task = self.task
+        if not task.in_team():  # 战斗结束保护：结算 / 队伍界面不再释放
+            return
         if self.instant_ult_enabled and task.use_ult():
             task.log_info("立即释放终结技")
             return
         if self.instant_link_enabled and task.use_link_skill():
             task.log_info("立即释放连携技")
-            return
 
     def _is_low_resolution(self) -> bool:
         """当前画面分辨率是否低于 1080p。"""
